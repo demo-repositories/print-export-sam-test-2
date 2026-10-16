@@ -1,0 +1,451 @@
+name: provision-functions-deploy
+on:
+  repository_dispatch:
+    types: [provision-functions-deploy, provision-functions-destroy]
+concurrency:
+  group: provision-functions-${{ github.repository }}
+  cancel-in-progress: false
+jobs:
+  deploy:
+    if: github.event.action == 'provision-functions-deploy'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    env:
+      BLUEPRINT_DIRECTORY: ${{ github.event.client_payload.blueprintDirectory }}
+      STACK_NAME: ${{ github.event.client_payload.stackName }}
+      NEEDS_ANTHROPIC_KEY: ${{ github.event.client_payload.needsAnthropicKey }}
+      SANITY_STUDIO_PROJECT_ID: ${{ secrets.SANITY_PROJECT_ID }}
+      SANITY_STUDIO_DATASET: ${{ secrets.SANITY_DATASET }}
+      SANITY_ORGANIZATION_ID: ${{ secrets.SANITY_ORGANIZATION_ID }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Mask credentials
+        env:
+          SANITY_AUTH_TOKEN: ${{ secrets.SANITY_FUNCTIONS_DEPLOY_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SANITY_TELEMETRY_DISABLED: '1'
+          DO_NOT_TRACK: '1'
+        run: |
+          set -euo pipefail
+          test -n "$STACK_NAME"
+          shopt -s inherit_errexit
+          echo "::add-mask::$SANITY_AUTH_TOKEN"
+          if [ -n "$ANTHROPIC_API_KEY" ]; then echo "::add-mask::$ANTHROPIC_API_KEY"; fi
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+          if [ -f pnpm-lock.yaml ]; then corepack enable && pnpm install --frozen-lockfile
+          elif [ -f yarn.lock ]; then corepack enable && yarn install --frozen-lockfile
+          else npm ci --legacy-peer-deps || npm install --legacy-peer-deps; fi
+      - name: Build functions when declared
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+          node -e "const s=require('./package.json').scripts||{};console.log('Root scripts:',Object.keys(s).join(', '))"
+          if node -e "const s=require('./package.json').scripts||{};process.exit(s['build:functions']?0:1)"; then npm run build:functions
+          elif node -e "const s=require('./package.json').scripts||{};process.exit(s.build&&s.build.includes('--filter')&&s.build.includes('function')?0:1)"; then npm run build
+          else echo "No unambiguous root functions build script found; skipping"; fi
+      - name: Initialize, validate, and deploy
+        working-directory: ${{ env.BLUEPRINT_DIRECTORY }}
+        env:
+          SANITY_AUTH_TOKEN: ${{ secrets.SANITY_FUNCTIONS_DEPLOY_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SANITY_TELEMETRY_DISABLED: '1'
+          DO_NOT_TRACK: '1'
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+          if pnpm exec sanity --version >/dev/null 2>&1; then CANDIDATE=(pnpm exec sanity)
+          elif yarn exec sanity --version >/dev/null 2>&1; then CANDIDATE=(yarn exec sanity)
+          elif npx --no-install sanity --version >/dev/null 2>&1; then CANDIDATE=(npx --no-install sanity)
+          else CANDIDATE=(); fi
+          if [ "${#CANDIDATE[@]}" -gt 0 ] && [ "$("${CANDIDATE[@]}" --version | sed -E 's/[^0-9]*([0-9]+).*/\1/')" -ge 8 ]; then SANITY=("${CANDIDATE[@]}")
+          else SANITY=(npx --yes @sanity/cli@8.16.0); fi
+          echo "Using Sanity CLI: $("${SANITY[@]}" --version)"
+          cat > "$RUNNER_TEMP/resolve-function-stack.cjs" <<'RESOLVER'
+          
+          const fs = require('fs');
+          const stackName = process.argv[2];
+          if (!stackName) {
+            console.error('Stack name is required');
+            process.exit(2);
+          }
+          const output = fs.readFileSync(0, 'utf8');
+          const idPattern = /^ST-[A-Za-z0-9]+$/;
+          let parsed;
+          try { parsed = JSON.parse(output); } catch { throw new Error('Blueprint stack JSON listing was invalid'); }
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Blueprint stack JSON listing had an unknown shape');
+          if (Object.prototype.hasOwnProperty.call(parsed, 'error')) {
+            const message = parsed.error && typeof parsed.error === 'object' && typeof parsed.error.message === 'string'
+              ? parsed.error.message
+              : 'Blueprint stack listing failed';
+            throw new Error(message);
+          }
+          if (!Array.isArray(parsed.stacks)) throw new Error('Blueprint stack JSON listing had an unknown shape');
+          const matches = parsed.stacks.filter((item) => item && typeof item === 'object' && item.name === stackName);
+          if (matches.length > 1) throw new Error('Blueprint stack listing contained duplicate names');
+          const match = matches[0];
+          process.stdout.write(match && typeof match.id === 'string' && idPattern.test(match.id) ? match.id : '');
+          RESOLVER
+          cat > "$RUNNER_TEMP/assert-function-stack-inputs.cjs" <<'INPUT_ASSERTION'
+          const fs = require('node:fs')
+          const path = require('node:path')
+          
+          const mismatch = (field) => {
+            console.error('::error::FUNCTION_STACK_CONFIG_MISMATCH ' + field)
+            process.exit(1)
+          }
+          const manifestNames = [
+            'blueprint.json',
+            'blueprint.js',
+            'blueprint.mjs',
+            'blueprint.ts',
+            'sanity.blueprint.json',
+            'sanity.blueprint.js',
+            'sanity.blueprint.mjs',
+            'sanity.blueprint.ts',
+          ]
+          const manifestIdPattern = /["']?\b(organizationId|projectId|stackId)\b["']?\s*:/
+          const environmentIdPattern = /^(?!\s*#)\s*(?:export\s+)?(?:SANITY_PROJECT_ID|SANITY_BLUEPRINT_STACK_ID|SANITY_BLUEPRINT_PATH)\s*=/m
+          
+          for (const name of manifestNames) {
+            const manifestPath = path.join(process.cwd(), name)
+            if (fs.existsSync(manifestPath) && manifestIdPattern.test(fs.readFileSync(manifestPath, 'utf8'))) {
+              mismatch('manifest')
+            }
+          }
+          
+          const blueprintDirectory = path.resolve(process.cwd())
+          const workspace = process.env.GITHUB_WORKSPACE ? path.resolve(process.env.GITHUB_WORKSPACE) : blueprintDirectory
+          let directory = blueprintDirectory
+          while (true) {
+            for (const name of ['.env', '.env.local', '.env.development', '.env.development.local']) {
+              const environmentPath = path.join(directory, name)
+              if (fs.existsSync(environmentPath) && environmentIdPattern.test(fs.readFileSync(environmentPath, 'utf8'))) {
+                mismatch('env-file')
+              }
+            }
+            if (directory === workspace) break
+            const parent = path.dirname(directory)
+            if (parent === directory || !directory.startsWith(workspace + path.sep)) break
+            directory = parent
+          }
+          INPUT_ASSERTION
+          node "$RUNNER_TEMP/assert-function-stack-inputs.cjs"
+          printf "SANITY_STUDIO_PROJECT_ID=%s\nSANITY_STUDIO_DATASET=%s\n" "$SANITY_STUDIO_PROJECT_ID" "$SANITY_STUDIO_DATASET" > .env
+          if [ -d studio ]; then cp .env studio/.env; fi
+          if [ -e .sanity ] || [ -L .sanity ]; then
+            rm -rf .sanity
+            echo "Ignored checked-out Blueprint configuration"
+          fi
+          npx --yes @sanity/cli@8.16.0 blueprints stacks --organization-id "$SANITY_ORGANIZATION_ID" --json > stacks.json 2>stderr.log
+          existing=$(node "$RUNNER_TEMP/resolve-function-stack.cjs" "$STACK_NAME" < stacks.json)
+          if [ -n "$existing" ]; then "${SANITY[@]}" blueprints init --organization-id "$SANITY_ORGANIZATION_ID" --stack-id "$existing"
+          else "${SANITY[@]}" blueprints init --organization-id "$SANITY_ORGANIZATION_ID" --stack-name "$STACK_NAME"; fi
+          cat > "$RUNNER_TEMP/assert-function-stack-config.cjs" <<'CONFIG_ASSERTION'
+          const fs = require('node:fs')
+          
+          const [organizationId, expectedStackId] = process.argv.slice(2)
+          const configPath = '.sanity/blueprint.config.json'
+          const mismatch = (field) => {
+            console.error('::error::FUNCTION_STACK_CONFIG_MISMATCH ' + field)
+            process.exit(1)
+          }
+          
+          if (!fs.existsSync(configPath)) mismatch('blueprint.config.json')
+          
+          let config
+          try {
+            config = JSON.parse(fs.readFileSync(configPath, 'utf8'))
+          } catch {
+            mismatch('blueprint.config.json')
+          }
+          
+          if (!config || typeof config !== 'object' || Array.isArray(config)) mismatch('blueprint.config.json')
+          if (config.organizationId !== organizationId) mismatch('organizationId')
+          if (expectedStackId && config.stackId !== expectedStackId) mismatch('stackId')
+          if (Object.hasOwn(config, 'projectId')) mismatch('projectId')
+          CONFIG_ASSERTION
+          node "$RUNNER_TEMP/assert-function-stack-config.cjs" "$SANITY_ORGANIZATION_ID" "$existing"
+          SANITY_BLUEPRINT_STACK_ID=$(node -e "const config=require('./.sanity/blueprint.config.json'); process.stdout.write(config.stackId)")
+          export SANITY_BLUEPRINT_STACK_ID
+          printf 'SANITY_BLUEPRINT_STACK_ID=%s\n' "$SANITY_BLUEPRINT_STACK_ID" >> "$GITHUB_ENV"
+          if ! plan=$("${SANITY[@]}" blueprints plan 2>&1); then
+            echo "$plan"
+            trace_file=$(mktemp "$RUNNER_TEMP/function-stack-plan-trace.XXXXXX")
+            trap 'rm -f "$trace_file"' EXIT
+            set +e
+            SANITY_TRACE_MAX_LENGTH=8000 timeout 120 "${SANITY[@]}" blueprints plan --trace > "$trace_file" 2>&1
+            set -e
+            cat > "$RUNNER_TEMP/extract-function-stack-plan-trace.cjs" <<'TRACE_EXTRACTOR'
+          const fs = require('node:fs')
+          
+          const prefix = 'function-stack-plan| '
+          const maxLength = 300
+          const maxProblemMessages = 20
+          const stripControls = (value) => String(value).replace(/[\u0000-\u001f\u007f-\u009f]/g, '')
+          const bounded = (value) => stripControls(value).slice(0, maxLength)
+          const output = (value) => console.log(prefix + value)
+          const requestPattern = /^\[([^\]]+)\].*HTTP \u2192 (\S+) (\S+)$/
+          const responsePattern = /^\[([^\]]+)\].*HTTP \u2190 (\d{3})\s*(.*?)\s*\(\d+ms\)$/
+          const responseBodyPattern = /^\[([^\]]+)\].*HTTP \u2190 Body: (.*)$/
+          const isDiagnosticValue = (value) =>
+            typeof value === 'string' || (typeof value === 'number' && Number.isFinite(value))
+          
+          try {
+            const lines = fs.readFileSync(process.argv[2], 'utf8').split(/\r?\n/)
+            const requests = new Map()
+            const records = []
+          
+            for (const rawLine of lines) {
+              const line = rawLine.replace(/\u001b\[[0-?]*[ -\/]*[@-~]/g, '')
+              const request = line.match(requestPattern)
+              if (request) {
+                const [, id, method, url] = request
+                let pathname = ''
+                try {
+                  pathname = new URL(url).pathname
+                } catch {
+                  continue
+                }
+                if (requests.has(id)) throw new Error('duplicate trace request ID')
+                const record = {id, method, url, pathname, status: undefined, statusText: '', body: undefined}
+                requests.set(id, record)
+                records.push(record)
+                continue
+              }
+          
+              const response = line.match(responsePattern)
+              if (response) {
+                const record = requests.get(response[1])
+                if (record) {
+                  record.status = response[2]
+                  record.statusText = response[3]
+                }
+                continue
+              }
+          
+              const body = line.match(responseBodyPattern)
+              if (body) {
+                const record = requests.get(body[1])
+                if (record) record.body = body[2]
+              }
+            }
+          
+            const planIndex = records.findIndex((record) => /\/stacks\/[^/]+\/plan$/.test(record.pathname))
+            if (planIndex === -1) throw new Error('plan trace was not found')
+            const plan = records[planIndex]
+            if (!plan.status) throw new Error('plan response was not found')
+            const possibleLookup = records[planIndex - 1]
+            const lookup = possibleLookup && /\/stacks\/[^/]+$/.test(possibleLookup.pathname) ? possibleLookup : undefined
+          
+            for (const [label, record] of [['stack lookup', lookup], ['plan', plan]]) {
+              if (!record || !record.status) continue
+              output(label + ' status: ' + bounded(record.status + (record.statusText ? ' ' + record.statusText : '')))
+              if (!record.body) continue
+              let body
+              try {
+                body = JSON.parse(record.body)
+              } catch {
+                continue
+              }
+              if (!body || typeof body !== 'object' || Array.isArray(body)) continue
+              for (const field of ['status', 'message', 'code', 'error', 'statusCode']) {
+                if (field in body && isDiagnosticValue(body[field])) {
+                  output(label + ' ' + field + ': ' + bounded(body[field]))
+                }
+              }
+              if (Array.isArray(body.problems)) {
+                for (const problem of body.problems.slice(0, maxProblemMessages)) {
+                  if (problem && typeof problem === 'object' && isDiagnosticValue(problem.message)) {
+                    output(label + ' problems.message: ' + bounded(problem.message))
+                  }
+                }
+              }
+            }
+          } catch {
+            output('diagnostics unavailable')
+          }
+          TRACE_EXTRACTOR
+            command_token=$(node -e "process.stdout.write(require('node:crypto').randomBytes(16).toString('hex'))")
+            echo "::stop-commands::$command_token"
+            node "$RUNNER_TEMP/extract-function-stack-plan-trace.cjs" "$trace_file"
+            echo "::$command_token::"
+            if echo "$plan" | grep -q "requires a .project."; then echo "Document function requires a 'project' for an organization-scoped stack"; fi
+            exit 1
+          fi
+          "${SANITY[@]}" blueprints deploy
+          set +e
+          "${SANITY[@]}" blueprints info --json > function-stack-info.json 2>&1
+          info_status=$?
+          set -e
+          if [ "$info_status" -ne 0 ]; then printf '{}\n' > function-stack-info.json; fi
+          printf 'Raw blueprints info output:\n%s\n' "$(cat function-stack-info.json)"
+          cat > "$RUNNER_TEMP/write-function-stack-result.cjs" <<'RESULT_WRITER'
+          const fs = require('fs');
+          const config = JSON.parse(fs.readFileSync('.sanity/blueprint.config.json'));
+          let functions = [];
+          try {
+            const info = JSON.parse(fs.readFileSync('function-stack-info.json'));
+            const resources = info.stack?.resources ?? info.resources ?? [];
+            if (Array.isArray(resources)) {
+              functions = resources
+                .filter((resource) => typeof resource?.type === 'string' && resource.type.startsWith('sanity.function.'))
+                .map((resource) => resource.name)
+                .filter((name) => typeof name === 'string' && name.length > 0);
+            }
+          } catch {
+            console.log('Could not parse blueprints info --json; recording functions as []');
+          }
+          fs.writeFileSync('function-stack-result.json', JSON.stringify({
+            stackId: config.stackId,
+            stackName: process.env.STACK_NAME,
+            organizationId: config.organizationId,
+            functions,
+          }));
+          RESULT_WRITER
+          node "$RUNNER_TEMP/write-function-stack-result.cjs"
+      - name: Add function environment
+        working-directory: ${{ env.BLUEPRINT_DIRECTORY }}
+        env:
+          SANITY_AUTH_TOKEN: ${{ secrets.SANITY_FUNCTIONS_DEPLOY_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+          [ "$NEEDS_ANTHROPIC_KEY" = 'true' ] || exit 0
+          [ -n "$ANTHROPIC_API_KEY" ] || { echo 'Blueprint requires ANTHROPIC_API_KEY but the fork secret is missing' >&2; exit 1; }
+          if pnpm exec sanity --version >/dev/null 2>&1; then CANDIDATE=(pnpm exec sanity)
+          elif yarn exec sanity --version >/dev/null 2>&1; then CANDIDATE=(yarn exec sanity)
+          elif npx --no-install sanity --version >/dev/null 2>&1; then CANDIDATE=(npx --no-install sanity)
+          else CANDIDATE=(); fi
+          if [ "${#CANDIDATE[@]}" -gt 0 ] && [ "$("${CANDIDATE[@]}" --version | sed -E 's/[^0-9]*([0-9]+).*/\1/')" -ge 8 ]; then SANITY=("${CANDIDATE[@]}")
+          else SANITY=(npx --yes @sanity/cli@8.16.0); fi
+          echo "Using Sanity CLI: $("${SANITY[@]}" --version)"
+          # Blueprints info does not include resource environment names, so add the requested key to every deployed function.
+          cat > "$RUNNER_TEMP/list-deployed-functions.cjs" <<'FUNCTIONS'
+          const fs = require('fs');
+          const info = JSON.parse(fs.readFileSync('function-stack-info.json'));
+          const resources = info.stack?.resources ?? info.resources ?? [];
+          if (Array.isArray(resources)) {
+            for (const resource of resources) {
+              if (
+                typeof resource?.type === 'string' &&
+                resource.type.startsWith('sanity.function.') &&
+                typeof resource.name === 'string' &&
+                resource.name.length > 0
+              ) {
+                console.log(resource.name);
+              }
+            }
+          }
+          FUNCTIONS
+          function_names=$(node "$RUNNER_TEMP/list-deployed-functions.cjs")
+          [ -n "$function_names" ] || { echo 'Blueprint requires ANTHROPIC_API_KEY but no deployed functions were found' >&2; exit 1; }
+          while read -r function_name; do "${SANITY[@]}" functions env add "$function_name" ANTHROPIC_API_KEY "$ANTHROPIC_API_KEY"; done <<< "$function_names"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: function-stack-results
+          path: ${{ env.BLUEPRINT_DIRECTORY }}/function-stack-result.json
+          if-no-files-found: error
+  destroy:
+    if: github.event.action == 'provision-functions-destroy'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions: {}
+    env:
+      STACK_ID: ${{ github.event.client_payload.stackId }}
+      STACK_NAME: ${{ github.event.client_payload.stackName }}
+      SANITY_ORGANIZATION_ID: ${{ github.event.client_payload.organizationId }}
+    steps:
+      - name: Destroy Function stack
+        env:
+          SANITY_AUTH_TOKEN: ${{ secrets.SANITY_FUNCTIONS_DEPLOY_TOKEN }}
+          SANITY_TELEMETRY_DISABLED: '1'
+          DO_NOT_TRACK: '1'
+        run: |
+          set -euo pipefail
+          test -n "$STACK_NAME"
+          shopt -s inherit_errexit
+          cd "$RUNNER_TEMP"
+          echo "::add-mask::$SANITY_AUTH_TOKEN"
+          SANITY=(npx --yes @sanity/cli@8.16.0)
+          echo "Using Sanity CLI: $("${SANITY[@]}" --version)"
+          cat > "$RUNNER_TEMP/resolve-function-stack.cjs" <<'RESOLVER'
+          
+          const fs = require('fs');
+          const stackName = process.argv[2];
+          if (!stackName) {
+            console.error('Stack name is required');
+            process.exit(2);
+          }
+          const output = fs.readFileSync(0, 'utf8');
+          const idPattern = /^ST-[A-Za-z0-9]+$/;
+          let parsed;
+          try { parsed = JSON.parse(output); } catch { throw new Error('Blueprint stack JSON listing was invalid'); }
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Blueprint stack JSON listing had an unknown shape');
+          if (Object.prototype.hasOwnProperty.call(parsed, 'error')) {
+            const message = parsed.error && typeof parsed.error === 'object' && typeof parsed.error.message === 'string'
+              ? parsed.error.message
+              : 'Blueprint stack listing failed';
+            throw new Error(message);
+          }
+          if (!Array.isArray(parsed.stacks)) throw new Error('Blueprint stack JSON listing had an unknown shape');
+          const matches = parsed.stacks.filter((item) => item && typeof item === 'object' && item.name === stackName);
+          if (matches.length > 1) throw new Error('Blueprint stack listing contained duplicate names');
+          const match = matches[0];
+          process.stdout.write(match && typeof match.id === 'string' && idPattern.test(match.id) ? match.id : '');
+          RESOLVER
+          cat > "$RUNNER_TEMP/write-function-stack-destroy-result.cjs" <<'RESULT'
+          const fs = require('node:fs')
+          const [destroyStatus, stackId, stackName, organizationId] = process.argv.slice(2)
+          const parsed = JSON.parse(fs.readFileSync('stacks.json', 'utf8'))
+          const stacks = Array.isArray(parsed.stacks) ? parsed.stacks : []
+          const matchingStacks = stacks.flatMap((stack) => {
+            if (!stack || typeof stack !== 'object') return []
+            const id = typeof stack.id === 'string' ? stack.id : ''
+            const name = typeof stack.name === 'string' ? stack.name : ''
+            return id === stackId || name === stackName ? [{id, name}] : []
+          })
+          const result = {
+            destroyStatus,
+            stackId,
+            stackName,
+            organizationId,
+            postDestroyListing: {stackCount: stacks.length, matchingStacks},
+          }
+          fs.writeFileSync('function-stack-destroy-result.json', JSON.stringify(result))
+          RESULT
+          resolve_stack() {
+            npx --yes @sanity/cli@8.16.0 blueprints stacks --organization-id "$SANITY_ORGANIZATION_ID" --json > stacks.json 2>stderr.log
+            node "$RUNNER_TEMP/resolve-function-stack.cjs" "$STACK_NAME" < stacks.json
+          }
+          listed_stack_id=$(resolve_stack)
+          if [ -n "$STACK_ID" ] && [ -n "$listed_stack_id" ] && [ "$STACK_ID" != "$listed_stack_id" ]; then
+            echo "Recorded Function stack ID does not match the listed stack" >&2
+            exit 1
+          fi
+          write_destroy_result() {
+            node "$RUNNER_TEMP/write-function-stack-destroy-result.cjs" "$1" "$STACK_ID" "$STACK_NAME" "$SANITY_ORGANIZATION_ID"
+          }
+          if [ -z "$listed_stack_id" ]; then write_destroy_result not-found; exit 0; fi
+          STACK_ID="$listed_stack_id"
+          "${SANITY[@]}" blueprints destroy --stack "$STACK_ID" --organization-id "$SANITY_ORGANIZATION_ID" --force
+          remaining_stack_id=$(resolve_stack)
+          if [ -n "$remaining_stack_id" ]; then
+            echo "Function stack remains after destroy" >&2
+            exit 1
+          fi
+          write_destroy_result destroyed
+      - uses: actions/upload-artifact@v4
+        with:
+          name: function-stack-destroy-results
+          path: ${{ runner.temp }}/function-stack-destroy-result.json
+          if-no-files-found: error
